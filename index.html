@@ -285,7 +285,6 @@ function onSiteChange() {
 function addSiteData(site, text) {
   data[site] = parseText(text);
   if ($("site").value === site) {
-    if (!$("start").value || !$("end").value) setRangeLimits(site, false);
     onSiteChange();
   }
 }
@@ -324,8 +323,7 @@ async function init() {
     render();
   });
 
-  // On every page load: first date in the file through today.
-  if (data[$("site").value]) setRangeLimits($("site").value, false);
+  // On page load the dates start blank; the pickers allow the first date in the file through today.
   onSiteChange();
   if (failures.length && failures.length < CONFIG.sites.length)
     setStatus($("status").textContent + ` Couldn't load: ${failures.join(", ")}.`, true);
