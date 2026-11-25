@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cumulative Precipitation</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --surface: #ffffff; --text: #191919; --text2: #666666; --border: #d9d9d9;
+    --g1: #257de0; --g2: #f47230; --grid: #ececec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface: #191919; --text: #efefef; --text2: #9c9c9c; --border: #3a3a3a;
+            --g1: #338ced; --g2: #e76624; --grid: #2c2c2c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--surface); color: var(--text); }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--text2); margin: 0 0 20px; font-size: .9rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: end; margin-bottom: 16px; }
+  label { display: flex; flex-direction: column; font-size: .8rem; color: var(--text2); gap: 4px; }
+  select, input[type=date], button {
+    font: inherit; font-size: .95rem; padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 6px; background: var(--surface); color: var(--text); }
+  button { cursor: pointer; }
+  #status { color: var(--text2); font-size: .9rem; min-height: 1.2em; }
+  #status.err { color: #c0392b; }
+  #chart { width: 100%; height: 480px; }
+  .totals { display: flex; gap: 28px; flex-wrap: wrap; margin: 8px 0 20px; }
+  .total { font-size: .85rem; color: var(--text2); }
+  .total b { display: block; font-size: 1.3rem; color: var(--text); }
+  .swatch { display: inline-block; width: 18px; height: 0; border-top: 3px solid; vertical-align: middle; margin-right: 6px; }
+  details { font-size: .85rem; color: var(--text2); margin-top: 12px; }
+  details .row { margin: 8px 0; }
+  table { border-collapse: collapse; font-size: .85rem; margin-top: 8px; }
+  th, td { padding: 3px 12px; border-bottom: 1px solid var(--border); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cumulative Precipitation</h1>
+  <p class="sub">Running total of rain from the start date. Each day's tip amounts are added together; days with no tips count as 0.</p>
+
+  <div class="controls">
+    <label>Site <select id="site"></select></label>
+    <label>Start date <input type="date" id="start"></label>
+    <label>End date <input type="date" id="end"></label>
+    <button id="full" type="button">First date to today</button>
+    <button id="reset" type="button">Reset</button>
+  </div>
+  <p id="status">Loading data…</p>
+
+  <div class="totals" id="totals"></div>
+  <div id="chart"></div>
+
+  <details>
+    <summary>Load a data file manually</summary>
+    <p>Use this if the page can't load the files automatically (for example, when the page is opened straight from your computer).</p>
+    <div id="manual"></div>
+  </details>
+  <details>
+    <summary>Show daily values as a table</summary>
+    <div id="table"></div>
+  </details>
+</main>
+
+<script>
+/* ================== SETTINGS — edit these ================== */
+const CONFIG = {
+  // One converted data file per site, in the same folder as this page
+  // (later this can be a full web address on another server).
+  sites: [
+    { name: "Dead Run Near Catonsville", file: "DR5_Precip.dat" },
+    { name: "UMBC Campus",               file: "UMBC-TRC_Precip.dat" }
+  ],
+  gageNames: ["Gage 1", "Gage 2"], // gage 1 = 2nd-to-last column, gage 2 = last column
+  // Gage columns already hold rain in inches for each tip event (0.01, 0.021, ...),
+  // so they are added up as-is. If a file ever held tip counts instead, set this to 0.01.
+  valueMultiplier: 1,
+  tickDays: 14
+};
+/* =========================================================== */
+
+const DAY_MS = 86400000;
+const data = {};   // site name -> { daily: Map(date -> [tips1, tips2]), first, last }
+
+// ---------- parsing ----------
+const DATE_PATTERNS = [
+  [/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/, m => [m[1], m[2], m[3]]],   // 2024-05-01
+  [/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/, m => [m[3], m[1], m[2]]],   // 05/01/2024
+  [/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2})(?!\d)/, m => ["20" + m[3], m[1], m[2]]] // 05/01/24
+];
+function parseDate(s) {
+  s = s.replace(/"/g, "").trim();
+  for (const [re, f] of DATE_PATTERNS) {
+    const m = s.match(re);
+    if (m && m.index === 0) {
+      const [y, mo, d] = f(m).map(Number);
+      if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+      return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+  }
+  return null;
+}
+function splitLine(line) {
+  if (line.includes("\t")) return line.split("\t");
+  if (line.includes(",")) return line.split(",");
+  return line.split(/\s+/);
+}
+function toNum(s) {
+  const v = parseFloat(String(s).replace(/"/g, ""));
+  return Number.isFinite(v) ? v : 0;     // blanks, NAN, etc. count as 0 tips
+}
+function parseText(text) {
+  const daily = new Map();
+  for (let line of text.split(/\r?\n/)) {
+    line = line.replace(/^ +| +$/g, "");   // keep tabs so an empty last column stays a column
+    if (!line.trim()) continue;
+    const f = splitLine(line).map(x => x.trim());
+    if (f.length < 3) continue;
+    let date = null;
+    for (let i = 0; i < Math.min(3, f.length - 2) && !date; i++) date = parseDate(f[i]);
+    if (!date) continue;                  // header or junk line
+    const t = daily.get(date) || [0, 0];
+    t[0] += toNum(f[f.length - 2]);
+    t[1] += toNum(f[f.length - 1]);
+    daily.set(date, t);
+  }
+  if (!daily.size) throw new Error("no dated rows found");
+  const dates = [...daily.keys()].sort();
+  return { daily, first: dates[0], last: dates[dates.length - 1] };
+}
+
+// ---------- date helpers (UTC so there are no DST surprises) ----------
+const toMs = d => Date.parse(d + "T00:00:00Z");
+const toStr = ms => new Date(ms).toISOString().slice(0, 10);
+
+// ---------- cumulative series ----------
+function buildSeries(site, start, end) {
+  const { daily } = data[site];
+  const x = [], c1 = [], c2 = [], d1 = [], d2 = [];
+  let tips1 = 0, tips2 = 0;
+  for (let ms = toMs(start); ms <= toMs(end); ms += DAY_MS) {
+    const day = toStr(ms);
+    const [a, b] = daily.get(day) || [0, 0];   // missing day -> 0, line stays flat
+    tips1 += a; tips2 += b;
+    x.push(day);
+    d1.push(+(a * CONFIG.valueMultiplier).toFixed(3));
+    d2.push(+(b * CONFIG.valueMultiplier).toFixed(3));
+    c1.push(+(tips1 * CONFIG.valueMultiplier).toFixed(3));
+    c2.push(+(tips2 * CONFIG.valueMultiplier).toFixed(3));
+  }
+  return { x, c1, c2, d1, d2 };
+}
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function setStatus(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+// Today's date on the viewer's own clock (not UTC), as YYYY-MM-DD.
+function todayStr() {
+  const n = new Date();
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}-${String(n.getDate()).padStart(2, "0")}`;
+}
+// Selectable range: first date in the file through today (never a future date).
+function rangeFor(site) {
+  const first = data[site].first, today = todayStr();
+  return { first, last: first > today ? first : today };
+}
+
+function setRangeLimits(site, keep) {
+  const { first, last } = rangeFor(site);
+  for (const id of ["start", "end"]) { $(id).min = first; $(id).max = last; }
+  if (!keep) { $("start").value = first; $("end").value = last; }
+}
+
+function clampInputs() {
+  const site = $("site").value, { first, last } = rangeFor(site);
+  let s = $("start").value || first, e = $("end").value || last;
+  if (s < first) s = first; if (s > last) s = last;
+  if (e < first) e = first; if (e > last) e = last;
+  if (s > e) [s, e] = [e, s];
+  $("start").value = s; $("end").value = e;
+  return [s, e];
+}
+
+function tickStepDays(nDays) {
+  const maxLabels = Math.max(4, Math.floor(($("chart").clientWidth || 900) / 70));
+  return CONFIG.tickDays * Math.max(1, Math.ceil(nDays / CONFIG.tickDays / maxLabels));
+}
+
+function clearChart() {
+  Plotly.purge("chart"); $("totals").innerHTML = ""; $("table").innerHTML = "";
+}
+
+function render(note) {
+  const site = $("site").value;
+  if (!data[site]) {
+    clearChart();
+    setStatus(`No data loaded for ${site}. Use "Load a data file manually" below.`, true);
+    return;
+  }
+  const recorded = `${site}: data recorded ${data[site].first} to ${data[site].last}.`;
+  if (!$("start").value || !$("end").value) {
+    clearChart();
+    setStatus(`${recorded} Pick a start date and an end date to draw the graph.`);
+    return;
+  }
+  const [start, end] = clampInputs();
+  const s = buildSeries(site, start, end);
+  const [n1, n2] = CONFIG.gageNames;
+  const text = css("--text"), text2 = css("--text2"), grid = css("--grid");
+  const g1 = css("--g1"), g2 = css("--g2");
+
+  const trace = (name, y, daily, color, dash) => ({
+    x: s.x, y, name, type: "scatter", mode: s.x.length > 60 ? "lines" : "lines+markers",
+    line: { color, width: 2, dash }, marker: { size: 8, color },
+    customdata: daily,
+    hovertemplate: `${name}: %{y:.2f} in (that day %{customdata:.2f} in)<extra></extra>`
+  });
+
+  const layout = {
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { family: "system-ui, sans-serif", color: text2, size: 12 },
+    margin: { l: 64, r: 20, t: 10, b: 64 },
+    hovermode: "x unified",
+    hoverlabel: { font: { color: "#191919" } },
+    legend: { orientation: "h", x: 0, y: 1.08, font: { color: text } },
+    xaxis: {
+      // Labels every 14 days; on long ranges use every 28, 42, ... days so labels don't overlap.
+      type: "date", tick0: start, dtick: tickStepDays(s.x.length) * DAY_MS,
+      tickformat: "%b %d<br>%Y", hoverformat: "%b %d, %Y",
+      range: [toMs(start) - DAY_MS / 2, toMs(end) + DAY_MS / 2],
+      gridcolor: grid, linecolor: grid, zeroline: false
+    },
+    yaxis: {
+      title: { text: "Cumulative precipitation (inches)", font: { color: text2 } },
+      rangemode: "tozero", tickformat: ".2f", gridcolor: grid, zeroline: false
+    }
+  };
+  Plotly.react("chart", [trace(n1, s.c1, s.d1, g1, "solid"), trace(n2, s.c2, s.d2, g2, "dash")],
+               layout, { responsive: true, displaylogo: false });
+
+  const last = s.x.length - 1;
+  $("totals").innerHTML =
+    `<div class="total"><span class="swatch" style="border-color:${g1}"></span>${n1} total<b>${s.c1[last].toFixed(2)} in</b></div>` +
+    `<div class="total"><span class="swatch" style="border-color:${g2};border-top-style:dashed"></span>${n2} total<b>${s.c2[last].toFixed(2)} in</b></div>` +
+    `<div class="total">Period<b>${s.x.length} day${s.x.length > 1 ? "s" : ""}</b></div>`;
+
+  $("table").innerHTML = "<table><tr><th>Date</th>" +
+    `<th>${n1} daily</th><th>${n1} cumulative</th><th>${n2} daily</th><th>${n2} cumulative</th></tr>` +
+    s.x.map((d, i) => `<tr><td>${d}</td><td>${s.d1[i].toFixed(2)}</td><td>${s.c1[i].toFixed(2)}</td>` +
+      `<td>${s.d2[i].toFixed(2)}</td><td>${s.c2[i].toFixed(2)}</td></tr>`).join("") + "</table>";
+
+  setStatus(`${recorded} Days after the last record count as 0.` + (note ? " " + note : ""));
+}
+
+// Switching sites keeps the chosen dates, adjusted only if they fall outside the new site's data.
+function onSiteChange() {
+  const site = $("site").value;
+  if (!data[site]) { render(); return; }
+  setRangeLimits(site, true);
+  const { first, last } = rangeFor(site);
+  let s = $("start").value, e = $("end").value, note = "";
+  if (s && e) {
+    if (s > e) [s, e] = [e, s];
+    if (e < first) {
+      s = first; e = last;
+      note = `Your dates were all before this site's data begins, so its full record is shown.`;
+    } else if (s < first) {
+      s = first;
+      note = `Start date moved to ${first}, the first date in this site's data.`;
+    }
+    $("start").value = s; $("end").value = e;
+  }
+  render(note);
+}
+
+function addSiteData(site, text) {
+  data[site] = parseText(text);
+  if ($("site").value === site) {
+    if (!$("start").value || !$("end").value) setRangeLimits(site, false);
+    onSiteChange();
+  }
+}
+
+async function init() {
+  $("site").innerHTML = CONFIG.sites.map(s => `<option>${s.name}</option>`).join("");
+  $("manual").innerHTML = CONFIG.sites.map((s, i) =>
+    `<div class="row">${s.name}: <input type="file" data-site="${s.name}" accept=".dat,.txt,.csv,text/plain"></div>`).join("");
+  $("manual").addEventListener("change", e => {
+    const input = e.target, file = input.files[0];
+    if (!file) return;
+    file.text().then(t => {
+      try { addSiteData(input.dataset.site, t); $("site").value = input.dataset.site; onSiteChange(); }
+      catch (err) { setStatus(`${file.name}: ${err.message}`, true); }
+    });
+  });
+
+  const failures = [];
+  await Promise.all(CONFIG.sites.map(async s => {
+    try {
+      const r = await fetch(s.file, { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      data[s.name] = parseText(await r.text());
+    } catch (e) { failures.push(s.file); }
+  }));
+
+  $("site").addEventListener("change", onSiteChange);
+  $("start").addEventListener("change", () => render());
+  $("end").addEventListener("change", () => render());
+  $("full").addEventListener("click", () => {
+    if (data[$("site").value]) setRangeLimits($("site").value, false);
+    render();
+  });
+  $("reset").addEventListener("click", () => {   // clear the dates and the graph
+    $("start").value = ""; $("end").value = "";
+    render();
+  });
+
+  // On every page load: first date in the file through today.
+  if (data[$("site").value]) setRangeLimits($("site").value, false);
+  onSiteChange();
+  if (failures.length && failures.length < CONFIG.sites.length)
+    setStatus($("status").textContent + ` Couldn't load: ${failures.join(", ")}.`, true);
+}
+init();
+</script>
+</body>
+</html>
